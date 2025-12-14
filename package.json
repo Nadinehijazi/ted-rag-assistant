@@ -4,11 +4,16 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "ingest": "node scripts/ingest.js",
     "build": "next build",
     "start": "next start",
     "lint": "eslint"
   },
   "dependencies": {
+    "@pinecone-database/pinecone": "^6.1.3",
+    "csv-parse": "^6.1.0",
+    "dotenv": "^17.2.3",
+    "llmod": "^2.0.0",
     "next": "16.0.8",
     "react": "19.2.1",
     "react-dom": "19.2.1"
