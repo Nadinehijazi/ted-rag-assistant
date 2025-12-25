@@ -1,27 +1,41 @@
-// app/api/prompt/route.ts
+﻿// app/api/prompt/route.ts
 import { NextResponse } from "next/server";
 
+// -------------------------
+// Required models (assignment)
+// -------------------------
 const EMBEDDING_MODEL =
   process.env.EMBEDDING_MODEL ?? "RPRTHPB-text-embedding-3-small";
 const CHAT_MODEL = process.env.CHAT_MODEL ?? "RPRTHPB-gpt-5-mini";
 
+// -------------------------
+// Pinecone + Gateway (LLMod)
+// -------------------------
 const PINECONE_API_KEY = process.env.PINECONE_API_KEY;
 const PINECONE_HOST = process.env.PINECONE_HOST;
 
 const LLMOD_API_KEY = process.env.LLMOD_API_KEY;
 const LLMOD_BASE_URL = process.env.LLMOD_BASE_URL ?? "";
 
-// Informational only (aligns with your ingest)
-const CHUNK_SIZE = 1024;
-const OVERLAP_RATIO = 0.2;
+// -------------------------
+// RAG hyperparameters (must match /api/stats elsewhere)
+// -------------------------
+const CHUNK_SIZE = 1024; // informational
+const OVERLAP_RATIO = 0.2; // informational
 
 // Default baseline
 const TOP_K = 5;
 
-// --- Strict / fact QA guardrails ---
-const MIN_SCORE = Number(process.env.MIN_SCORE ?? "0.2");
-const MODEL_CONTEXT_K = Math.max(1, Number(process.env.MODEL_CONTEXT_K ?? "3"));
+// Assignment constraint: Pinecone topK must be <= 30
+const MAX_TOPK = 30;
 
+// Thresholds
+const MIN_SCORE = Number(process.env.MIN_SCORE ?? "0.22"); // for QA/summary gating
+const LISTING_MIN_SCORE = Number(process.env.LISTING_MIN_SCORE ?? "0.25"); // for lists / rec
+const META_MIN_SCORE = Number(process.env.META_MIN_SCORE ?? "0.20"); // for deterministic metadata (speaker/title)
+
+// Context controls
+const MODEL_CONTEXT_K = Math.max(1, Number(process.env.MODEL_CONTEXT_K ?? "3"));
 const MAX_CONTEXT_CHARS_PER_CHUNK = Number(
   process.env.MAX_CONTEXT_CHARS_PER_CHUNK ?? "1800"
 );
@@ -29,25 +43,25 @@ const MAX_TOTAL_CONTEXT_CHARS = Number(
   process.env.MAX_TOTAL_CONTEXT_CHARS ?? "6500"
 );
 
-// --- Listing / recommendation tuning ---
-const LISTING_TOPK = Number(process.env.LISTING_TOPK ?? "30");
-const LISTING_MIN_SCORE = Number(process.env.LISTING_MIN_SCORE ?? "0.20");
+// Listing
+const LISTING_TOPK = Math.min(MAX_TOPK, Number(process.env.LISTING_TOPK ?? "30"));
 
-// --- Fallback retrieval (general robustness) ---
-const FALLBACK_TOPK = Number(process.env.FALLBACK_TOPK ?? "30");
+// Fallback retrieval
+const FALLBACK_TOPK = Math.min(MAX_TOPK, Number(process.env.FALLBACK_TOPK ?? "30"));
 const FALLBACK_MIN_SCORE = Number(process.env.FALLBACK_MIN_SCORE ?? "0.35");
 
-// ✅ Assignment constraint: Pinecone topK must be <= 30
-const MAX_TOPK = 30;
-
-// Small helpers
+// -------------------------
+// Types
+// -------------------------
 type ContextItem = {
   talk_id: string;
   title: string;
   chunk: string;
   score: number;
+
+  // internal-only for deterministic metadata answers
+  speaker?: string;
   url?: string;
-  speaker_1?: string;
 };
 
 type PineconeMatch = {
@@ -60,6 +74,9 @@ type PineconeQueryResponse = {
   matches?: PineconeMatch[];
 };
 
+// -------------------------
+// Helpers
+// -------------------------
 function mustEnv(name: string, v: string | undefined | null): string {
   if (!v) throw new Error(`Missing env var: ${name}`);
   return v;
@@ -71,34 +88,43 @@ function isNonEmptyString(x: unknown): x is string {
 
 function getString(md: Record<string, unknown>, key: string): string {
   const v = md[key];
-  return typeof v === "string" ? v : String(v ?? "");
+  const s = typeof v === "string" ? v : String(v ?? "");
+  const t = s.trim();
+  if (!t || t === "null" || t === "undefined") return "";
+  return t;
 }
 
 function extractChunk(md: Record<string, unknown>): string {
-  const v =
-    md["chunk_text"] ?? md["chunk"] ?? md["text"] ?? md["passage"] ?? "";
+  const v = md["chunk_text"] ?? md["chunk"] ?? md["text"] ?? md["passage"] ?? "";
   return String(v ?? "");
 }
 
-function normalize(s: string): string {
+// speaker can be stored under different keys depending on ingest
+function extractSpeaker(md: Record<string, unknown>): string {
+  const candidates = [
+    getString(md, "speaker"),
+    getString(md, "speaker_1"),
+    getString(md, "speaker_name"),
+    getString(md, "speaker1"),
+  ].filter((s) => isNonEmptyString(s));
+  return candidates[0] ?? "";
+}
+
+function extractUrl(md: Record<string, unknown>): string {
+  const candidates = [
+    getString(md, "url"),
+    getString(md, "talk_url"),
+    getString(md, "ted_url"),
+  ].filter((s) => isNonEmptyString(s));
+  return candidates[0] ?? "";
+}
+
+function normalizeText(s: string): string {
   return (s ?? "")
     .replace(/\r\n/g, "\n")
     .replace(/[^\S\n]+/g, " ")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
-}
-
-/**
- * Extract first quoted string from question (single/double quotes).
- * This is general-purpose: many users specify talk names like '...'.
- */
-function extractQuotedTitle(question: string): string | null {
-  const q = question ?? "";
-  const m1 = q.match(/'([^']{3,120})'/);
-  if (m1?.[1]) return m1[1].trim();
-  const m2 = q.match(/"([^"]{3,120})"/);
-  if (m2?.[1]) return m2[1].trim();
-  return null;
 }
 
 function normTitle(s: string): string {
@@ -110,9 +136,15 @@ function normTitle(s: string): string {
     .trim();
 }
 
-/**
- * Keywords used only for snippet windowing (not retrieval).
- */
+function extractQuotedTitle(question: string): string | null {
+  const q = question ?? "";
+  const m1 = q.match(/'([^']{3,160})'/);
+  if (m1?.[1]) return m1[1].trim();
+  const m2 = q.match(/"([^"]{3,160})"/);
+  if (m2?.[1]) return m2[1].trim();
+  return null;
+}
+
 function pickKeywords(question: string): string[] {
   const STOP = new Set([
     "what",
@@ -139,18 +171,25 @@ function pickKeywords(question: string): string[] {
     "give",
     "provide",
     "find",
+    "speaker",
+    "title",
+    "url",
+    "link",
+    "talk_id",
+    "chunk_index",
+    "metadata",
   ]);
 
-  const words = question
+  return (question ?? "")
     .toLowerCase()
     .split(/\W+/)
-    .filter((w) => w.length >= 4 && !STOP.has(w));
-
-  return words.reverse().slice(0, 12);
+    .filter((w) => w.length >= 4 && !STOP.has(w))
+    .reverse()
+    .slice(0, 12);
 }
 
 function smartSnippet(text: string, question: string, maxChars: number): string {
-  const t = normalize(text);
+  const t = normalizeText(text);
   if (t.length <= maxChars) return t;
 
   const kws = pickKeywords(question);
@@ -175,34 +214,125 @@ function smartSnippet(text: string, question: string, maxChars: number): string 
   );
 }
 
-// -------------------------
-// Query capability detection
-// -------------------------
-function isMultiResultListingQ(q: string): boolean {
-  const s = q.toLowerCase();
-  const wants3 =
-    s.includes("exactly 3") || s.includes("three") || /\b3\b/.test(s);
-  const listing =
-    s.includes("talk titles") ||
-    s.includes("titles") ||
-    s.includes("list") ||
-    s.includes("return a list");
-  return wants3 && listing;
+function dedupeByTalk(items: ContextItem[]): ContextItem[] {
+  const best = new Map<string, ContextItem>();
+  for (const it of items) {
+    const prev = best.get(it.talk_id);
+    if (!prev || it.score > prev.score) best.set(it.talk_id, it);
+  }
+  return Array.from(best.values());
 }
 
+function normalizeRetrieved(pc: PineconeQueryResponse): ContextItem[] {
+  return (pc.matches ?? [])
+    .map((m: PineconeMatch): ContextItem => {
+      const md = (m.metadata ?? {}) as Record<string, unknown>;
+      const score = typeof m.score === "number" ? m.score : 0;
+
+      return {
+        talk_id: getString(md, "talk_id"),
+        title: getString(md, "title"),
+        chunk: extractChunk(md),
+        speaker: extractSpeaker(md),
+        url: extractUrl(md),
+        score,
+      };
+    })
+    .filter(
+      (c) =>
+        isNonEmptyString(c.talk_id) &&
+        isNonEmptyString(c.title) &&
+        isNonEmptyString(c.chunk)
+    )
+    .sort((a, b) => b.score - a.score);
+}
+
+function buildContextBlock(modelContext: ContextItem[], question: string): string {
+  let total = 0;
+  const parts: string[] = [];
+
+  for (let i = 0; i < modelContext.length; i++) {
+    const c = modelContext[i];
+    const snippet = smartSnippet(c.chunk, question, MAX_CONTEXT_CHARS_PER_CHUNK);
+
+    const part =
+      `[#${i + 1}] talk_id="${c.talk_id}" title="${c.title}" score=${c.score}\n` +
+      `${snippet}`;
+
+    if (total + part.length > MAX_TOTAL_CONTEXT_CHARS) break;
+
+    parts.push(part);
+    total += part.length + 8;
+  }
+
+  return parts.length ? parts.join("\n\n---\n\n") : "(No context retrieved)";
+}
+
+function formatNumberedTitles(titles: string[]): string {
+  return titles.map((t, i) => `${i + 1}) ${t}`).join("\n");
+}
+
+function answerUnknown(systemPrompt: string, userPrompt: string, ctx: any[] = []) {
+  return NextResponse.json({
+    response: "I don't know based on the provided TED data.",
+    context: ctx,
+    Augmented_prompt: { System: systemPrompt, User: userPrompt },
+  });
+}
+
+// -------------------------
+// Question classification
+// -------------------------
+type ListingSpec = { count: 1 | 2 | 3; mode: "exactly" | "up_to" } | null;
+
+function wordToNum(w: string): 1 | 2 | 3 | null {
+  if (w === "1" || w === "one") return 1;
+  if (w === "2" || w === "two") return 2;
+  if (w === "3" || w === "three") return 3;
+  return null;
+}
+
+function getListingSpec(q: string): ListingSpec {
+  const s = (q ?? "").toLowerCase().replace(/\s+/g, " ").trim();
+
+  const hasTitles = /\btitles?\b/.test(s) && /\btalk\b/.test(s);
+  const hasListingVerb =
+    /\b(list|return|give|show|provide)\b/.test(s) || /\b(a list of)\b/.test(s);
+  const hasSmallNumber = /\b(1|2|3|one|two|three)\b/.test(s);
+
+  if (!(hasTitles && hasListingVerb && hasSmallNumber)) return null;
+
+  const mAny = s.match(/\b(1|2|3|one|two|three)\b/);
+  const n = mAny?.[1] ? wordToNum(mAny[1]) : null;
+  if (!n) return null;
+
+  if (/\bup\s+to\b/.test(s)) return { count: n, mode: "up_to" };
+
+  const mExactly = s.match(/\bexactly\s+(1|2|3|one|two|three)\b/);
+  if (mExactly?.[1]) {
+    const count = wordToNum(mExactly[1]);
+    return count ? { count, mode: "exactly" } : null;
+  }
+
+  return { count: n, mode: "exactly" };
+}
+
+// Recommendation intent (type 4)
 function isRecommendationQ(q: string): boolean {
-  const s = q.toLowerCase();
+  const s = (q ?? "").toLowerCase();
   return (
     s.includes("recommend") ||
     s.includes("which talk should") ||
     s.includes("what talk should") ||
     s.includes("suggest a talk") ||
-    s.includes("what should i watch")
+    s.includes("what should i watch") ||
+    s.includes("i’m looking for a ted talk") ||
+    s.includes("im looking for a ted talk")
   );
 }
 
 function isKeyIdeaSummaryQ(q: string): boolean {
-  const s = q.toLowerCase();
+  const s = (q ?? "").toLowerCase();
   return (
     s.includes("main idea") ||
     s.includes("key idea") ||
@@ -210,6 +340,35 @@ function isKeyIdeaSummaryQ(q: string): boolean {
     s.includes("summary") ||
     s.includes("what is this talk about")
   );
+}
+
+// Speaker question detection (type: metadata)
+function isSpeakerQ(q: string): boolean {
+  const s = (q ?? "").toLowerCase();
+  return s.includes("who is the speaker") || s.includes("speaker of");
+}
+
+/**
+ * ✅ NEW: Precise Fact Retrieval (Type 1)
+ * Detect: "Find a TED talk..." + "Provide the title and speaker"
+ * We should answer deterministically from metadata: title + speaker.
+ */
+function isFactRetrievalTitleSpeakerQ(q: string): boolean {
+  const s = (q ?? "").toLowerCase().replace(/\s+/g, " ").trim();
+
+  const wantsFind =
+    s.includes("find a ted talk") ||
+    s.includes("find a talk") ||
+    s.startsWith("find ") ||
+    s.includes("locate a ted talk");
+
+  const wantsTitle = /\bprovide\b/.test(s) && /\btitle\b/.test(s);
+  const wantsSpeaker = /\bspeaker\b/.test(s);
+
+  // IMPORTANT: do not confuse with recommendation
+  const notRec = !isRecommendationQ(s);
+
+  return wantsFind && wantsTitle && wantsSpeaker && notRec;
 }
 
 // -------------------------
@@ -254,7 +413,11 @@ async function pineconeQuery(
   const apiKey = mustEnv("PINECONE_API_KEY", PINECONE_API_KEY);
 
   const url = `${host}/query`;
-  const body: any = { vector: vec, topK: Math.min(MAX_TOPK, topK), includeMetadata: true };
+  const body: any = {
+    vector: vec,
+    topK: Math.min(MAX_TOPK, Math.max(1, topK)),
+    includeMetadata: true,
+  };
   if (filter && Object.keys(filter).length > 0) body.filter = filter;
 
   const res = await fetch(url, {
@@ -313,97 +476,12 @@ async function callChat(system: string, user: string): Promise<string> {
 }
 
 // -------------------------
-// Context helpers
-// -------------------------
-function buildTranscriptContextBlock(
-  modelContext: ContextItem[],
-  question: string
-): string {
-  let total = 0;
-  const parts: string[] = [];
-
-  for (let i = 0; i < modelContext.length; i++) {
-    const c = modelContext[i];
-    const snippet = smartSnippet(c.chunk, question, MAX_CONTEXT_CHARS_PER_CHUNK);
-
-    const part =
-      `[#${i + 1}] talk_id="${c.talk_id}" title="${c.title}" score=${c.score}\n` +
-      snippet;
-
-    if (total + part.length > MAX_TOTAL_CONTEXT_CHARS) break;
-
-    parts.push(part);
-    total += part.length + 8;
-  }
-
-  return parts.length ? parts.join("\n\n---\n\n") : "(No context retrieved)";
-}
-
-function buildTitleOnlyContextBlock(modelContext: ContextItem[]): string {
-  if (!modelContext.length) return "(No context retrieved)";
-  return modelContext
-    .map(
-      (c, i) =>
-        `[#${i + 1}] talk_id="${c.talk_id}" title="${c.title}" score=${c.score}`
-    )
-    .join("\n");
-}
-
-// Keep best match per talk_id (diversity)
-function dedupeByTalk(items: ContextItem[]): ContextItem[] {
-  const best = new Map<string, ContextItem>();
-  for (const it of items) {
-    const prev = best.get(it.talk_id);
-    if (!prev || it.score > prev.score) best.set(it.talk_id, it);
-  }
-  return Array.from(best.values());
-}
-
-// If user quoted a title, pull best chunk(s) from that talk if present in retrieved set
-function pickByQuotedTitle(
-  retrieved: ContextItem[],
-  quotedTitle: string,
-  k: number
-): ContextItem[] {
-  const qt = normTitle(quotedTitle);
-  const hits = retrieved
-    .filter((c) => isNonEmptyString(c.chunk) && normTitle(c.title) === qt)
-    .sort((a, b) => b.score - a.score);
-  return hits.slice(0, k);
-}
-
-function normalizeRetrieved(
-  pc: PineconeQueryResponse,
-  wantListing3: boolean
-): ContextItem[] {
-  const retrievedAll: ContextItem[] = (pc.matches ?? [])
-    .map((m: PineconeMatch): ContextItem => {
-      const md = (m.metadata ?? {}) as Record<string, unknown>;
-      const score = typeof m.score === "number" ? m.score : 0;
-      return {
-        talk_id: getString(md, "talk_id"),
-        title: getString(md, "title"),
-        url: getString(md, "url"),
-        speaker_1: getString(md, "speaker_1"),
-        chunk: extractChunk(md),
-        score,
-      };
-    })
-    .filter((c) => {
-      if (!isNonEmptyString(c.talk_id)) return false;
-      if (!isNonEmptyString(c.title)) return false;
-      if (wantListing3) return true; // titles only OK
-      return isNonEmptyString(c.chunk); // transcript evidence required
-    })
-    .sort((a, b) => b.score - a.score);
-
-  return retrievedAll;
-}
-
-// -------------------------
-// Route
+// Route: POST /api/prompt
 // -------------------------
 export async function POST(req: Request) {
+  // ✅ "Truth stamp" to verify this file is running
+  console.log("🔥 RUNNING app/api/prompt/route.ts");
+
   try {
     const body: unknown = await req.json();
     const question = (body as any)?.question;
@@ -412,58 +490,75 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Missing question" }, { status: 400 });
     }
 
-    // Detect capability
-    const wantListing3 = isMultiResultListingQ(question);
+    const systemPrompt =
+      `You are a TED Talk assistant that answers questions strictly and only based on the TED dataset context provided to you (metadata and transcript passages). ` +
+      `You must not use any external knowledge, the open internet, or information that is not explicitly contained in the retrieved context. ` +
+      `If the answer cannot be determined from the provided context, respond: "I don't know based on the provided TED data." ` +
+      `Always ground your answer in the given context, quoting exact phrases when helpful.`;
+
+    // ---------- intent ----------
+    const listingSpec = getListingSpec(question);
+    const wantListing = listingSpec !== null;
+
+    // Type 4
     const wantRec = isRecommendationQ(question);
+
+    // Type (summary)
     const wantSummary = isKeyIdeaSummaryQ(question);
 
-    // 1) Embed
-    const qVec = await embedQuery(question);
+    // Metadata: speaker-of specific talk
+    const wantSpeakerOnly = isSpeakerQ(question);
 
-    // Optional: if user quotes a title, we can bias retrieval with a metadata filter.
-    // IMPORTANT: this is general and safe, but we do NOT rely on it exclusively.
+    // ✅ Type 1: Find talk + provide title and speaker (deterministic metadata answer)
+    const wantFactTitleSpeaker = isFactRetrievalTitleSpeakerQ(question);
+
     const quotedTitle = extractQuotedTitle(question);
     const titleFilter =
       quotedTitle && quotedTitle.length >= 3
         ? { title: { $eq: quotedTitle } }
         : undefined;
 
-    // 2) First pass retrieval (normal) — ✅ cap to MAX_TOPK
-    const topK1 =
-      wantListing3 || wantRec
-        ? Math.min(MAX_TOPK, Math.max(LISTING_TOPK, TOP_K * 10))
-        : Math.min(MAX_TOPK, Math.max(20, TOP_K * 8));
+    // ---------- retrieval ----------
+    const qVec = await embedQuery(question);
 
-    // Try with title filter only if we have it (helps pinpoint), otherwise general query.
+    // First pass: if listing -> high topK; else moderate
+    const topK1 = wantListing
+      ? LISTING_TOPK
+      : Math.min(MAX_TOPK, Math.max(12, TOP_K * 3));
+
     const pc1 = await pineconeQuery(qVec, topK1, titleFilter);
-    const retrieved1 = normalizeRetrieved(pc1, wantListing3);
+    const retrieved1 = normalizeRetrieved(pc1);
 
-    // 3) Decide if we need fallback retrieval
-    const distinctTalks1 = dedupeByTalk(retrieved1).length;
+    // Decide fallback
+    const enoughForListing = wantListing
+      ? dedupeByTalk(retrieved1.filter((c) => c.score >= LISTING_MIN_SCORE)).length >=
+        listingSpec!.count
+      : true;
+
+    const bestScore1 = retrieved1[0]?.score ?? 0;
 
     const needsFallback =
-      (wantListing3 && distinctTalks1 < 3) ||
-      (!wantListing3 && retrieved1.length === 0) ||
-      (!wantListing3 &&
+      retrieved1.length === 0 ||
+      (wantListing && !enoughForListing) ||
+      (!wantListing &&
+        !wantSpeakerOnly &&
+        !wantFactTitleSpeaker &&
         !wantRec &&
         !wantSummary &&
-        retrieved1.filter((x) => x.score >= MIN_SCORE).length < 1);
+        bestScore1 < MIN_SCORE);
 
     let retrievedAll = retrieved1;
 
     if (needsFallback) {
-      // 2nd pass retrieval: no filter (avoid exact-match pitfalls), higher topK — ✅ cap to MAX_TOPK
-      const pc2 = await pineconeQuery(
-        qVec,
-        Math.min(MAX_TOPK, FALLBACK_TOPK)
-      );
-      const retrieved2 = normalizeRetrieved(pc2, wantListing3);
+      // Second pass: remove title filter, bigger topK (still capped at 30)
+      const pc2 = await pineconeQuery(qVec, FALLBACK_TOPK);
+      const retrieved2 = normalizeRetrieved(pc2);
 
-      // Merge results (dedupe by vector id isn't available here, so we dedupe by talk+chunk prefix)
+      // Merge (dedupe by talk_id + chunk prefix)
       const seen = new Set<string>();
       const merged: ContextItem[] = [];
       for (const r of [...retrieved1, ...retrieved2]) {
-        const key = `${r.talk_id}::${r.title}::${r.chunk.slice(0, 60)}`;
+        const key = `${r.talk_id}::${r.title}::${r.chunk.slice(0, 80)}`;
         if (seen.has(key)) continue;
         seen.add(key);
         merged.push(r);
@@ -472,80 +567,135 @@ export async function POST(req: Request) {
       retrievedAll = merged;
     }
 
-    // 4) Build modelContext by capability
+    // ---------- build modelContext ----------
     let modelContext: ContextItem[] = [];
 
-    if (wantListing3) {
+    if (wantListing) {
       const filtered = retrievedAll.filter((c) => c.score >= LISTING_MIN_SCORE);
       const deduped = dedupeByTalk(filtered).sort((a, b) => b.score - a.score);
-      modelContext = deduped.slice(0, 3);
+      modelContext = deduped.slice(0, listingSpec!.count);
+    } else if (wantFactTitleSpeaker || wantSpeakerOnly) {
+      // Deterministic metadata answers: pick ONE best talk (dedupe so we don't mix)
+      const filtered = retrievedAll.filter((c) => c.score >= META_MIN_SCORE);
+      const deduped = dedupeByTalk(filtered).sort((a, b) => b.score - a.score);
+
+      if (quotedTitle) {
+        const qt = normTitle(quotedTitle);
+        const locked = deduped.filter((c) => normTitle(c.title) === qt);
+        modelContext = (locked.length ? locked : deduped).slice(0, 1);
+      } else {
+        modelContext = deduped.slice(0, 1);
+      }
     } else if (wantRec) {
       const filtered = retrievedAll.filter((c) => c.score >= LISTING_MIN_SCORE);
       const deduped = dedupeByTalk(filtered).sort((a, b) => b.score - a.score);
       modelContext = deduped.slice(0, Math.max(3, MODEL_CONTEXT_K));
     } else if (wantSummary) {
-      const min = Math.min(MIN_SCORE, 0.45);
-      modelContext = retrievedAll.filter((c) => c.score >= min).slice(0, 1);
-      if (modelContext.length === 0) modelContext = retrievedAll.slice(0, 1);
+      modelContext = retrievedAll.slice(0, 1);
     } else {
-      const strict = retrievedAll.filter((c) => c.score >= MIN_SCORE);
-
-      const forced = quotedTitle
-        ? pickByQuotedTitle(
-            retrievedAll,
-            quotedTitle,
-            Math.max(1, Math.min(2, MODEL_CONTEXT_K))
-          )
-        : [];
-
-      const forcedKeys = new Set(
-        forced.map((c) => `${c.talk_id}::${c.chunk.slice(0, 60)}`)
-      );
-
-      const rest = strict
-        .filter((c) => !forcedKeys.has(`${c.talk_id}::${c.chunk.slice(0, 60)}`))
-        .slice(0, Math.max(0, MODEL_CONTEXT_K - forced.length));
-
-      modelContext = [...forced, ...rest];
-
-      if (modelContext.length === 0) {
-        modelContext = retrievedAll
-          .filter((c) => c.score >= FALLBACK_MIN_SCORE)
-          .slice(0, MODEL_CONTEXT_K);
-      }
+      modelContext = retrievedAll.slice(0, MODEL_CONTEXT_K);
     }
 
-    // 5) Prompts (must)
-    const systemPrompt =
-      `You are a TED Talk assistant that answers questions strictly and only based on the TED dataset context provided to you (metadata and transcript passages). ` +
-      `You must not use any external knowledge, the open internet, or information that is not explicitly contained in the retrieved context. ` +
-      `If the answer cannot be determined from the provided context, respond: "I don't know based on the provided TED data." ` +
-      `Always ground your answer in the given context, quoting exact phrases when helpful.`;
+    const responseContext = modelContext.map(({ talk_id, title, chunk, score }) => ({
+      talk_id,
+      title,
+      chunk,
+      score,
+    }));
 
-    const contextBlock = wantListing3
-      ? buildTitleOnlyContextBlock(modelContext)
-      : buildTranscriptContextBlock(modelContext, question);
+    // ---------- no context ----------
+    if (modelContext.length === 0) {
+      return answerUnknown(systemPrompt, question, []);
+    }
+
+    // ---------- gating ----------
+    const bestScore = modelContext[0]?.score ?? 0;
+    if (!wantListing && !wantSpeakerOnly && !wantFactTitleSpeaker && bestScore < MIN_SCORE) {
+      return answerUnknown(systemPrompt, question, []);
+    }
+
+    // -------------------------
+    // 1) LISTING (deterministic)
+    // -------------------------
+    if (wantListing) {
+      const titles = modelContext.map((c) => c.title);
+      const n = listingSpec!.count;
+
+      if (listingSpec!.mode === "exactly") {
+        if (titles.length < n) return answerUnknown(systemPrompt, question, responseContext);
+        return NextResponse.json({
+          response: formatNumberedTitles(titles.slice(0, n)),
+          context: responseContext,
+          Augmented_prompt: { System: systemPrompt, User: question },
+        });
+      }
+
+      if (titles.length === 0) return answerUnknown(systemPrompt, question, responseContext);
+
+      return NextResponse.json({
+        response: formatNumberedTitles(titles.slice(0, Math.min(n, titles.length))),
+        context: responseContext,
+        Augmented_prompt: { System: systemPrompt, User: question },
+      });
+    }
+
+    // -------------------------
+    // 2) SPEAKER ONLY (deterministic)
+    // -------------------------
+    if (wantSpeakerOnly) {
+      const best = modelContext[0];
+      const speaker = (best.speaker ?? "").trim();
+
+      if (!isNonEmptyString(speaker)) {
+        return answerUnknown(systemPrompt, question, responseContext);
+      }
+
+      return NextResponse.json({
+        response: speaker,
+        context: responseContext,
+        Augmented_prompt: { System: systemPrompt, User: question },
+      });
+    }
+
+    // -------------------------
+    // ✅ 3) TYPE 1: Fact retrieval (Title + Speaker) deterministic
+    // -------------------------
+    if (wantFactTitleSpeaker) {
+      const best = modelContext[0];
+      const title = (best.title ?? "").trim();
+      const speaker = (best.speaker ?? "").trim();
+
+      // For type-1: must provide both; if missing -> refuse
+      if (!isNonEmptyString(title) || !isNonEmptyString(speaker)) {
+        return answerUnknown(systemPrompt, question, responseContext);
+      }
+
+      return NextResponse.json({
+        response: `${title} — ${speaker}`,
+        context: responseContext,
+        Augmented_prompt: { System: systemPrompt, User: question },
+      });
+    }
+
+    // -------------------------
+    // 4) GPT RAG (summary / recommendation / QA)
+    // -------------------------
+    const contextBlock = buildContextBlock(modelContext, question);
 
     let extraInstr = "";
-    if (wantListing3) {
-      extraInstr =
-        `- Return EXACTLY 3 distinct TED talk titles.\n` +
-        `- Use only titles that appear in the CONTEXT.\n` +
-        `- Output format: a numbered list of 3 lines (1..3).\n`;
-    } else if (wantRec) {
+    if (wantRec) {
       extraInstr =
         `- Recommend ONE TED talk from the CONTEXT.\n` +
-        `- Justify with evidence-based quotes/paraphrases from the transcript.\n`;
+        `- Justify with evidence-based quotes/paraphrases from the transcript.\n` +
+        `- Output must include the chosen title.\n`;
     } else if (wantSummary) {
       extraInstr =
-        `- Identify the relevant talk in the CONTEXT.\n` +
         `- Provide the talk title and a concise summary of its main idea.\n` +
         `- Ground the summary in transcript evidence.\n`;
     } else {
       extraInstr =
         `- If the context contains the answer, you MUST answer.\n` +
-        `- Prefer the most direct sentence(s) that answer the question.\n` +
-        `- Cite the exact phrase(s) that support your answer.\n`;
+        `- Prefer the most direct sentence(s) that answer the question.\n`;
     }
 
     const userPrompt =
@@ -556,25 +706,7 @@ export async function POST(req: Request) {
       extraInstr +
       `- Otherwise say: "I don't know based on the provided TED data."`;
 
-    // 6) If no context, don't call LLM
-    if (modelContext.length === 0) {
-      return NextResponse.json({
-        response: "I don't know based on the provided TED data.",
-        context: [],
-        Augmented_prompt: { System: systemPrompt, User: userPrompt },
-      });
-    }
-
-    // 7) Chat
     const response = await callChat(systemPrompt, userPrompt);
-
-    // ✅ Assignment output format: context must contain ONLY talk_id/title/chunk/score
-    const responseContext = modelContext.map(({ talk_id, title, chunk, score }) => ({
-      talk_id,
-      title,
-      chunk,
-      score,
-    }));
 
     return NextResponse.json({
       response,
@@ -582,9 +714,6 @@ export async function POST(req: Request) {
       Augmented_prompt: { System: systemPrompt, User: userPrompt },
     });
   } catch (e: any) {
-    return NextResponse.json(
-      { error: e?.message ?? "Unknown error" },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: e?.message ?? "Unknown error" }, { status: 500 });
   }
 }
