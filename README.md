@@ -25,7 +25,6 @@ In this project:
 This approach produces **more factual and explainable answers**.
 
 Retrieval-Augmented Generation is a widely used architecture for building knowledge assistants and domain-specific AI systems.  
-https://arxiv.org/abs/2005.11401
 
 ---
 
