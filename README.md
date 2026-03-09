@@ -208,23 +208,6 @@ ideas across different domains.
 
 ---
 
-# Future Improvements
-
-Possible extensions:
-
-- multi-document summarization
-- citation links to TED talks
-- hybrid search (keyword + vector)
-- streaming responses
-- evaluation with RAG benchmarks
-
----
-
-# License
-
-MIT License
-
----
 
 # References
 
