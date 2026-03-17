@@ -206,15 +206,3 @@ ideas across different domains.
 ```
 
 ---
-
-
-# References
-
-Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks  
-https://arxiv.org/abs/2005.11401
-
-Next.js Documentation  
-https://nextjs.org/docs
-
-Pinecone Vector Database  
-https://www.pinecone.io/docs/
